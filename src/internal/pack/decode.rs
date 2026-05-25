@@ -2,10 +2,11 @@
 //! and populates caches/metadata for downstream consumers.
 
 use std::{
+    fs::File,
     io::{self, BufRead, Cursor, ErrorKind, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -77,6 +78,36 @@ struct SharedParams {
     pub callback: Arc<dyn Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send>,
 }
 
+///新增的packstats类
+/// Summary of object types decoded from a pack file.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PackStats {
+    pub total: usize,
+    pub commits: usize,
+    pub trees: usize,
+    pub blobs: usize,
+    pub tags: usize,
+    pub deltas: usize,
+}
+
+impl PackStats {
+    fn record(&mut self, obj_type: ObjectType, is_delta: bool) {
+        self.total += 1;
+
+        match obj_type {
+            ObjectType::Commit => self.commits += 1,
+            ObjectType::Tree => self.trees += 1,
+            ObjectType::Blob => self.blobs += 1,
+            ObjectType::Tag => self.tags += 1,
+            _ => {}
+        }
+
+        if is_delta {
+            self.deltas += 1;
+        }
+    }
+}
+
 impl Drop for Pack {
     fn drop(&mut self) {
         if self.clean_tmp {
@@ -127,6 +158,29 @@ impl Pack {
             cache_objs_mem: Arc::new(AtomicUsize::default()),
             clean_tmp,
         }
+    }
+
+    ///新增stas_from_path函数
+    /// Decode a pack file and return a simple object type summary.
+    pub fn stats_from_path(path: impl AsRef<Path>) -> Result<PackStats, GitError> {
+        let file = File::open(path)?;
+        let mut reader = io::BufReader::new(file);
+        let mut pack = Pack::new(Some(2), Some(64 * 1024 * 1024), None, true);
+
+        let stats = Arc::new(Mutex::new(PackStats::default()));
+        let stats_for_callback = stats.clone();
+
+        pack.decode(
+            &mut reader,
+            move |entry| {
+                if let Ok(mut stats) = stats_for_callback.lock() {
+                    stats.record(entry.inner.obj_type, entry.meta.is_delta.unwrap_or(false));
+                }
+            },
+            None::<fn(ObjectHash)>,
+        )?;
+
+        Ok(stats.lock().expect("pack stats lock poisoned").clone())
     }
 
     /// Checks and reads the header of a Git pack file.
@@ -809,6 +863,7 @@ mod tests {
     use tokio_util::io::ReaderStream;
 
     use crate::{
+        errors::GitError,
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
         internal::pack::{Pack, tests::init_logger},
     };
@@ -1058,5 +1113,34 @@ mod tests {
                 let _ = futures::future::join(f1, f2).await;
             }
         });
+    }
+
+    ///新增正常路径测试
+    #[test]
+    fn test_pack_stats_from_small_sha1_pack() -> Result<(), GitError> {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/small-sha1.pack");
+
+        let stats = Pack::stats_from_path(path)?;
+
+        assert_eq!(stats.total, 19);
+        assert_eq!(stats.commits, 2);
+        assert_eq!(stats.trees, 2);
+        assert_eq!(stats.blobs, 15);
+        assert_eq!(stats.tags, 0);
+        assert_eq!(stats.deltas, 0);
+
+        Ok(())
+    }
+
+    ///新增错误路径测试
+    #[test]
+    fn test_pack_stats_returns_error_for_missing_pack() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/missing.pack");
+
+        let err = Pack::stats_from_path(path).expect_err("missing pack should fail");
+
+        assert!(matches!(err, GitError::IOError(_)));
     }
 }
