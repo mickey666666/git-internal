@@ -1143,4 +1143,15 @@ mod tests {
 
         assert!(matches!(err, GitError::IOError(_)));
     }
+
+    ///新增非法pack文件测试
+    #[test]
+    fn test_pack_stats_returns_error_for_invalid_pack_header() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        file.write_all(b"NOPE").expect("write invalid pack content");
+
+        let err = Pack::stats_from_path(file.path()).expect_err("invalid pack should fail");
+
+        assert!(matches!(err, GitError::InvalidPackHeader(_)));
+    }
 }
